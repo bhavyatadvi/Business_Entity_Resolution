@@ -1,0 +1,35 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Testing and tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment variables
+.env
+.env.*
+
+# Data and generated artifacts
+artifacts/*
+output/*
+student_resource/*
+
+# Keep folder placeholders
+!student_resource/.gitkeep
+!artifacts/.gitkeep
+!output/.gitkeep
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.cache/

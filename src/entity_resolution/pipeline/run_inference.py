@@ -356,6 +356,135 @@ def score_one_source1(
     )
 
 
+def count_tsv_data_rows(path):
+    """Count data rows without loading the full TSV into memory."""
+    newline_count = 0
+    last_byte = b""
+
+    with open(path, "rb") as file:
+        while True:
+            block = file.read(8 * 1024 * 1024)
+            if not block:
+                break
+            newline_count += block.count(b"\n")
+            last_byte = block[-1:]
+
+    line_count = newline_count
+    if last_byte and last_byte != b"\n":
+        line_count += 1
+
+    return max(0, line_count - 1)
+
+
+def index_is_complete(connection, max_block_size):
+    """Check whether the existing target index can be reused."""
+    required_tables = {"records", "blocking_keys", "key_counts"}
+    existing_tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+
+    if not required_tables.issubset(existing_tables):
+        return False
+
+    existing_indexes = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )
+    }
+
+    if not {"idx_block_lookup", "idx_record_source"}.issubset(
+        existing_indexes
+    ):
+        return False
+
+    metadata_exists = "index_metadata" in existing_tables
+
+    if metadata_exists:
+        metadata = dict(
+            connection.execute(
+                "SELECT key, value FROM index_metadata"
+            ).fetchall()
+        )
+        if metadata.get("max_block_size") != str(max_block_size):
+            print("Existing index uses a different block-size setting.")
+            return False
+    elif max_block_size != 500:
+        print(
+            "Legacy index has no saved configuration. "
+            "Only reuse it with the original default max-block-size of 500."
+        )
+        return False
+
+    for source, filename in SOURCE_FILES.items():
+        path = DATASET_ROOT / "test" / filename
+        if not path.exists():
+            return False
+
+        expected_rows = count_tsv_data_rows(path)
+        indexed_rows = connection.execute(
+            "SELECT COUNT(*) FROM records WHERE source = ?",
+            (source,),
+        ).fetchone()[0]
+
+        print(
+            f"Index check {source}: "
+            f"database={indexed_rows:,}, file={expected_rows:,}"
+        )
+
+        if indexed_rows != expected_rows:
+            print(f"Index for {source} is incomplete.")
+            return False
+
+        key_count = connection.execute(
+            "SELECT COUNT(*) FROM blocking_keys WHERE source = ?",
+            (source,),
+        ).fetchone()[0]
+
+        if expected_rows > 0 and key_count == 0:
+            print(f"Index for {source} contains no blocking keys.")
+            return False
+
+    return True
+
+
+def load_completed_ids(path, expected_header):
+    """Read IDs already written to a partial output file."""
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+
+    completed = set()
+
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.reader(file, delimiter="\t")
+
+        header = next(reader, None)
+        if header != expected_header:
+            raise ValueError(
+                f"Unexpected header in {path}: {header!r}"
+            )
+
+        for line_number, row in enumerate(reader, start=2):
+            if len(row) != 2 or not row[0]:
+                raise ValueError(
+                    f"Invalid row in {path} at line {line_number}. "
+                    "Preserve the backup before repairing this file."
+                )
+
+            source1_id = row[0]
+            if source1_id in completed:
+                raise ValueError(
+                    f"Duplicate Source 1 ID {source1_id} in {path}"
+                )
+
+            completed.add(source1_id)
+
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -375,6 +504,13 @@ def main():
         raise ValueError("--max-source1 must be positive")
     if args.max_target_rows is not None and args.max_target_rows < 1:
         raise ValueError("--max-target-rows must be positive")
+
+    # Limited smoke tests must not be mixed with a full inference run.
+    if args.max_source1 is not None or args.max_target_rows is not None:
+        raise ValueError(
+            "This resumable runner is for full inference. "
+            "Use a separate output directory for smoke tests."
+        )
 
     artifact_path = Path(args.model_path)
     if not artifact_path.exists():
@@ -398,8 +534,42 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
     database_path = cache_dir / "test_entity_index.sqlite"
 
-    if database_path.exists():
-        database_path.unlink()
+    output_dir = PROJECT_ROOT / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = output_dir / "candidate_pairs.tsv"
+    matching_path = output_dir / "matching_results.tsv"
+
+    source1_path = DATASET_ROOT / "test" / "test_source1.tsv"
+    if not source1_path.exists():
+        raise FileNotFoundError(f"Missing test dataset: {source1_path}")
+
+    candidate_header = [
+        "source1_entity_id",
+        "candidate_entity_ids",
+    ]
+    matching_header = [
+        "source1_entity_id",
+        "matched_entity_ids",
+    ]
+
+    # Do not silently mix output files from different runs.
+    candidate_ids = load_completed_ids(candidate_path, candidate_header)
+    matching_ids = load_completed_ids(matching_path, matching_header)
+
+    if (candidate_ids is None) != (matching_ids is None):
+        raise RuntimeError(
+            "Only one output file exists. Restore both matching and "
+            "candidate files from the same checkpoint before resuming."
+        )
+
+    if candidate_ids is not None and candidate_ids != matching_ids:
+        raise RuntimeError(
+            "Candidate and matching files contain different Source 1 IDs. "
+            "Do not append to them until the checkpoint is repaired."
+        )
+
+    completed_ids = candidate_ids or set()
+    print(f"Previously completed Source 1 entities: {len(completed_ids):,}")
 
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -408,54 +578,66 @@ def main():
     connection.execute("PRAGMA cache_size = -50000")
     connection.execute("PRAGMA temp_store = FILE")
 
-    output_dir = PROJECT_ROOT / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    candidate_path = output_dir / "candidate_pairs.tsv"
-    matching_path = output_dir / "matching_results.tsv"
-
     try:
-        build_target_index(
-            connection,
-            args.max_block_size,
-            args.max_target_rows,
-        )
-
-        source1_path = DATASET_ROOT / "test" / "test_source1.tsv"
-        if not source1_path.exists():
-            raise FileNotFoundError(
-                f"Missing test dataset: {source1_path}"
+        # Reuse the database if its records and indexes are complete.
+        if database_path.exists() and index_is_complete(
+            connection, args.max_block_size
+        ):
+            print("Reusing the existing SQLite target index.")
+        else:
+            print("A complete compatible index was not found.")
+            print("Building the target index from scratch...")
+            build_target_index(
+                connection,
+                args.max_block_size,
+                None,
             )
 
-        processed = 0
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS index_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            connection.execute(
+                "INSERT OR REPLACE INTO index_metadata VALUES (?, ?)",
+                ("max_block_size", str(args.max_block_size)),
+            )
+            connection.commit()
+
+            if not index_is_complete(connection, args.max_block_size):
+                raise RuntimeError(
+                    "The index failed its post-build completeness check."
+                )
+
+        mode = "a" if candidate_ids is not None else "w"
 
         with (
             candidate_path.open(
-                "w", encoding="utf-8", newline=""
+                mode, encoding="utf-8", newline=""
             ) as candidate_file,
             matching_path.open(
-                "w", encoding="utf-8", newline=""
+                mode, encoding="utf-8", newline=""
             ) as matching_file,
         ):
             candidate_writer = csv.writer(
-                candidate_file, delimiter="\t",
+                candidate_file,
+                delimiter="\t",
                 lineterminator="\n",
             )
             matching_writer = csv.writer(
-                matching_file, delimiter="\t",
+                matching_file,
+                delimiter="\t",
                 lineterminator="\n",
             )
 
-            candidate_writer.writerow([
-                "source1_entity_id", "candidate_entity_ids"
-            ])
-            matching_writer.writerow([
-                "source1_entity_id", "matched_entity_ids"
-            ])
+            if mode == "w":
+                candidate_writer.writerow(candidate_header)
+                matching_writer.writerow(matching_header)
 
-            for chunk in read_chunks(
-                source1_path, args.max_source1
-            ):
+            processed_this_run = 0
+
+            for chunk in read_chunks(source1_path):
                 missing = set(SOURCE_COLUMNS) - set(chunk.columns)
                 if missing:
                     raise ValueError(
@@ -465,6 +647,9 @@ def main():
                 for record in chunk.to_dict("records"):
                     source1_id = str(record["entity_id"])
 
+                    if source1_id in completed_ids:
+                        continue
+
                     candidates, matches = score_one_source1(
                         connection,
                         record,
@@ -472,33 +657,55 @@ def main():
                         threshold,
                     )
 
-                    # Every Source 1 entity gets exactly one row,
-                    # including entities with no candidates or matches.
+                    # Each completed entity gets one row in each output.
                     candidate_writer.writerow([
-                        source1_id, ",".join(sorted(set(candidates)))
+                        source1_id,
+                        ",".join(sorted(set(candidates))),
                     ])
                     matching_writer.writerow([
-                        source1_id, ",".join(matches)
+                        source1_id,
+                        ",".join(matches),
                     ])
 
-                    processed += 1
+                    completed_ids.add(source1_id)
+                    processed_this_run += 1
+
+                    # Flush periodically so interruptions lose little work.
+                    if processed_this_run % 100 == 0:
+                        candidate_file.flush()
+                        matching_file.flush()
+                        print(
+                            f"Completed this run: {processed_this_run:,}; "
+                            f"total completed: {len(completed_ids):,}"
+                        )
 
                 candidate_file.flush()
                 matching_file.flush()
-                print(f"Processed Source 1 entities: {processed:,}")
+                print(
+                    f"Checkpoint saved. Total completed: "
+                    f"{len(completed_ids):,}"
+                )
 
-        print("\nInference finished.")
-        print(f"Source 1 entities processed: {processed:,}")
+        expected_source1_rows = count_tsv_data_rows(source1_path)
+        if len(completed_ids) != expected_source1_rows:
+            print(
+                f"WARNING: {len(completed_ids):,} Source 1 entities "
+                f"completed; expected {expected_source1_rows:,}. "
+                "Resume again to finish the remaining entities."
+            )
+        else:
+            print("\nInference finished for every Source 1 entity.")
+
         print(f"Candidate file: {candidate_path}")
         print(f"Matching file: {matching_path}")
         print(f"SQLite index: {database_path}")
 
-        if args.max_source1 is not None or args.max_target_rows is not None:
-            print(
-                "\nWARNING: This was a limited smoke test. "
-                "Do not submit these output files."
-            )
-
+    except KeyboardInterrupt:
+        print(
+            "\nInterrupted. Completed output rows have been flushed "
+            "periodically. Run this command again to resume."
+        )
+        raise
     finally:
         connection.close()
 
